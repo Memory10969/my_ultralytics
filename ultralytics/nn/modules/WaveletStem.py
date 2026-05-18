@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ================== Haar 小波滤波器生成 ==================
+# ================== 修正后的 Haar 小波滤波器生成 ==================
 def haar_filters(in_channels: int):
     """
     生成形状为 (in_channels*4, 1, 2, 2) 的滤波器，
@@ -11,11 +11,14 @@ def haar_filters(in_channels: int):
     """
     dec_lo = torch.tensor([1 / 2, 1 / 2])
     dec_hi = torch.tensor([1 / 2, -1 / 2])
+    # 四个基滤波器，形状 (1,1,2,2)
     base_LL = (dec_lo.unsqueeze(0) * dec_lo.unsqueeze(1)).unsqueeze(0).unsqueeze(0)
     base_LH = (dec_lo.unsqueeze(0) * dec_hi.unsqueeze(1)).unsqueeze(0).unsqueeze(0)
     base_HL = (dec_hi.unsqueeze(0) * dec_lo.unsqueeze(1)).unsqueeze(0).unsqueeze(0)
     base_HH = (dec_hi.unsqueeze(0) * dec_hi.unsqueeze(1)).unsqueeze(0).unsqueeze(0)
+    # 拼接成 (1,4,2,2)，即一个通道的四个滤波器
     per_channel = torch.cat([base_LL, base_LH, base_HL, base_HH], dim=1)  # (1,4,2,2)
+    # 重复 in_channels 次 → (in_channels, 4, 2, 2)，然后 reshape 为 (4*in_channels, 1, 2, 2)
     per_channel = per_channel.repeat(in_channels, 1, 1, 1)
     return per_channel.reshape(in_channels * 4, 1, 2, 2)
 
@@ -25,58 +28,62 @@ def wavelet_decompose(x: torch.Tensor, filters: torch.Tensor) -> torch.Tensor:
     return F.conv2d(x, filters, stride=2, groups=C, padding=0)
 
 
-# ================== 十字卷积（3×3 仅保留中心行与中心列） ==================
-class CrossConv(nn.Module):
-    """3×3 深度卷积，仅保留十字形状的权重（中心行和中心列）"""
-    def __init__(self, channels: int):
+# ================== 方向性子带卷积 ==================
+class DirectionalConv(nn.Module):
+    """
+    根据不同子带特性设计的方向卷积：
+    - LL: 标准 3×3 深度卷积
+    - LH: (1,3) 垂直条状深度卷积（增强水平边缘）
+    - HL: (3,1) 水平条状深度卷积（增强垂直边缘）
+    - HH: 3×3 深度卷积，可初始化为对角模式（强化对角边缘）
+    """
+    def __init__(self, channels: int, mode: str, use_diag_init: bool = True):
         super().__init__()
-        self.conv = nn.Conv2d(channels, channels, 3, padding=1,
-                              groups=channels, bias=False)
-        # 初始化十字掩膜
-        mask = torch.zeros(1, 1, 3, 3)
-        mask[:, :, 1, :] = 1.0   # 中心行
-        mask[:, :, :, 1] = 1.0   # 中心列
-        self.register_buffer('mask', mask)
-        self.bn = nn.BatchNorm2d(channels)
-        self.act = nn.SiLU(inplace=True)
-
-    def forward(self, x):
-        weight = self.conv.weight * self.mask
-        x = F.conv2d(x, weight, self.conv.bias, stride=1, padding=1, groups=self.conv.groups)
-        return self.act(self.bn(x))
-
-
-# ================== 对角卷积（3×3 深度卷积，初始化为主/反对角） ==================
-class DiagConv(nn.Module):
-    """3×3 深度卷积，主对角线正权重，反对角线负权重"""
-    def __init__(self, channels: int):
-        super().__init__()
-        self.conv = nn.Conv2d(channels, channels, 3, padding=1,
-                              groups=channels, bias=False)
-        self._init_diag_weights()
+        self.mode = mode
+        if mode == 'll':
+            self.conv = nn.Conv2d(channels, channels, 3, padding=1,
+                                  groups=channels, bias=False)
+        elif mode == 'lh':
+            self.conv = nn.Conv2d(channels, channels, (1, 3), padding=(0, 1),
+                                  groups=channels, bias=False)
+        elif mode == 'hl':
+            self.conv = nn.Conv2d(channels, channels, (3, 1), padding=(1, 0),
+                                  groups=channels, bias=False)
+        elif mode == 'hh':
+            self.conv = nn.Conv2d(channels, channels, 3, padding=1,
+                                  groups=channels, bias=False)
+            if use_diag_init:
+                self._init_diag_weights()
+        else:
+            raise ValueError(f"Invalid mode: {mode}")
         self.bn = nn.BatchNorm2d(channels)
         self.act = nn.SiLU(inplace=True)
 
     def _init_diag_weights(self):
+        """初始化 HH 卷积核为对角增强模式（主对角线正，反对角线负）"""
         with torch.no_grad():
             weight = self.conv.weight  # (C, 1, 3, 3)
             nn.init.zeros_(weight)
+            # 主对角线 (+)
             weight[:, 0, 0, 0] = 1.0
-            weight[:, 0, 1, 1] = 2.0
+            weight[:, 0, 1, 1] = 1.0
             weight[:, 0, 2, 2] = 1.0
-            weight[:, 0, 0, 2] = -1.0
-            weight[:, 0, 2, 0] = -1.0
+            # 反对角线 (-)
+            weight[:, 0, 0, 2] = -0.5
+            weight[:, 0, 1, 1] -= 1.0  # 中心点被正对角线占用，适当调整
+            weight[:, 0, 2, 0] = -0.5
+            # 归一化
             C = weight.shape[0]
-            weight /= (weight.view(C, -1).norm(p=2, dim=1).view(C, 1, 1, 1) + 1e-6)
+            weight /= weight.view(C, -1).norm(p=2, dim=1).view(C, 1, 1, 1) + 1e-6
 
     def forward(self, x):
         return self.act(self.bn(self.conv(x)))
 
 
-# ================== 双分支 WaveletStem ==================
+# ================== 修正后的双分支 WaveletStem ==================
 class WaveletStem(nn.Module):
     """
-    双分支茎模块：
+    双分支茎模块（小波分支使用正确的滤波器分解）：
     分支1: 小波分解 → 方向卷积 → 拼接扩张
     分支2: 标准 3×3 stride2 卷积
     两分支拼接后 1×1 融合输出。
@@ -89,25 +96,10 @@ class WaveletStem(nn.Module):
 
         # ----- 小波分支 -----
         self.register_buffer('dec_filters', haar_filters(in_channels))
-
-        # LL: 标准 3×3 深度卷积
-        self.ll_conv = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels, 3, padding=1, groups=in_channels, bias=False),
-            nn.BatchNorm2d(in_channels),
-            nn.SiLU(inplace=True)
-        )
-
-        # LH / HL: 十字形深度卷积
-        self.lh_conv = CrossConv(in_channels)
-        self.hl_conv = CrossConv(in_channels)
-
-        # HH: 对角增强深度卷积
-        self.hh_conv = DiagConv(in_channels) if use_diag_init else nn.Sequential(
-            nn.Conv2d(in_channels, in_channels, 3, padding=1, groups=in_channels, bias=False),
-            nn.BatchNorm2d(in_channels),
-            nn.SiLU(inplace=True)
-        )
-
+        self.ll_conv = DirectionalConv(in_channels, 'll')
+        self.lh_conv = DirectionalConv(in_channels, 'lh')
+        self.hl_conv = DirectionalConv(in_channels, 'hl')
+        self.hh_conv = DirectionalConv(in_channels, 'hh', use_diag_init=use_diag_init)
         self.wavelet_expand = nn.Sequential(
             nn.Conv2d(in_channels * 4, out_channels, 1, bias=False),
             nn.BatchNorm2d(out_channels),
@@ -147,10 +139,10 @@ class WaveletStem(nn.Module):
         hh = coeffs[:, :, 3, :, :]
 
         # 方向卷积增强
-        ll = self.ll_conv(ll)    # 标准 3×3
-        lh = self.lh_conv(lh)    # 十字形卷积
-        hl = self.hl_conv(hl)    # 十字形卷积
-        hh = self.hh_conv(hh)    # 对角卷积
+        ll = self.ll_conv(ll)
+        lh = self.lh_conv(lh)
+        hl = self.hl_conv(hl)
+        hh = self.hh_conv(hh)
 
         wavelet_feat = torch.cat([ll, lh, hl, hh], dim=1)    # (B, 4*C_orig, H/2, W/2)
         wavelet_feat = self.wavelet_expand(wavelet_feat)      # (B, out_channels, H/2, W/2)
@@ -169,15 +161,17 @@ if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Device: {device}")
 
+    # 偶数尺寸
     x_even = torch.randn(2, 3, 640, 640).to(device)
-    x_odd  = torch.randn(2, 3, 641, 641).to(device)
+    # 奇数尺寸
+    x_odd = torch.randn(2, 3, 641, 641).to(device)
 
     model = WaveletStem(in_channels=3, out_channels=64, use_diag_init=True).to(device)
     model.eval()
 
     with torch.no_grad():
         out_even = model(x_even)
-        out_odd  = model(x_odd)
+        out_odd = model(x_odd)
 
     print(f"Even input: {x_even.shape} -> output: {out_even.shape}")
     print(f"Odd input: {x_odd.shape} -> output: {out_odd.shape}")
