@@ -59,6 +59,7 @@ from ultralytics.nn.modules.InterpDownsample import InterpDownsample
 from ultralytics.nn.modules.ChannelGateSepConv import ChannelGateSepConv
 from ultralytics.nn.modules.AddModules.ChannelAwareEdgeEnhance import ChannelAwareEdgeEnhance
 from ultralytics.nn.modules.AddModules.SoftFillEdgeEnhance import SoftFillEdgeEnhance
+from ultralytics.nn.modules.AddModules.LogWaveletDenoise import LogWaveletDenoise
 
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
@@ -1673,6 +1674,7 @@ def parse_model(d, ch, verbose=True):
             ChannelGateSepConv,
             ChannelAwareEdgeEnhance,
             SoftFillEdgeEnhance,
+            LogWaveletDenoise,
 
             Classify,
             Conv,
